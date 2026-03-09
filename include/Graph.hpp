@@ -46,6 +46,19 @@ class Graph {
             edges.push_back({u, v, rate, fee});
         }
 
+        void updateExchangeRate(const std::string& from, const std::string& to, double rate, double fee = 0.0) {
+            int u = addCurrency(from);
+            int v = addCurrency(to);
+
+            for (auto& edge : edges) {
+                if (edge.source == u && edge.destination == v) {
+                    edge.weight = rate;
+                    edge.fee = fee;
+                    return;
+                }  
+            }
+        }
+
         int getNumVertices() const { return numVertices; }
         const std::vector<Edge>& getEdges() const { return edges; }
         const std::vector<std::string>& getIndexToCurrency() const { return indexToCurrency; }
@@ -101,60 +114,60 @@ class Graph {
                 double weight = -std::log(actualRate);
                 if (minDistance[edge.source] != std::numeric_limits<double>::infinity() &&
                     minDistance[edge.source] + weight < minDistance[edge.destination]) {
-                        std::cout << "\n[$$$] ARBITRAGE OPPORTUNITY DETECTED! [$$$]" << std::endl;
-                        
-                        // --- Start of path extraction code ---
-                        int curr = edge.destination;
-                        // Move backward V times to guarantee that we are deep inside the cycle itself
-                        for (int i = 0; i < numVertices; ++i) {
-                            curr = predecessor[curr];
-                        }
+                    std::cout << "\n[$$$] ARBITRAGE OPPORTUNITY DETECTED! [$$$]" << std::endl;
+                    
+                    // --- Start of path extraction code ---
+                    int curr = edge.destination;
+                    // Move backward V times to guarantee that we are deep inside the cycle itself
+                    for (int i = 0; i < numVertices; ++i) {
+                        curr = predecessor[curr];
+                    }
 
-                        int  cycleStart = curr;
-                        std::vector<int> cycle;
-                        
-                        // Collect the nodes (currencies) that belong to the cycle
-                        do {
-                            cycle.push_back(curr);
-                            curr = predecessor[curr];
-                        } while (curr  != cycleStart);
-                        cycle.push_back(cycleStart); 
-                        
-                        // Print the route (it was collected from end to start, so print it in reverse)
-                        std::cout << "[ROUTE] Execute Trade: ";
-                        for (int i = cycle.size() - 1; i >= 0; --i) {
-                            std::cout << indexToCurrency[cycle[i]];
-                            if (i > 0) std::cout << " -> ";
-                        }
-                        std::cout << "\n" << std::endl;
-                        // --- End of path extraction code ---
+                    int  cycleStart = curr;
+                    std::vector<int> cycle;
+                    
+                    // Collect the nodes (currencies) that belong to the cycle
+                    do {
+                        cycle.push_back(curr);
+                        curr = predecessor[curr];
+                    } while (curr  != cycleStart);
+                    cycle.push_back(cycleStart); 
+                    
+                    // Print the route (it was collected from end to start, so print it in reverse)
+                    std::cout << "[ROUTE] Execute Trade: ";
+                    for (int i = cycle.size() - 1; i >= 0; --i) {
+                        std::cout << indexToCurrency[cycle[i]];
+                        if (i > 0) std::cout << " -> ";
+                    }
+                    std::cout << "\n" << std::endl;
+                    // --- End of path extraction code ---
 
-                        // --- Start of profit calculation code ---
-                        double profitMultiplier = 1.0; // Start with "one unit" of the initial currency
+                    // --- Start of profit calculation code ---
+                    double profitMultiplier = 1.0; // Start with "one unit" of the initial currency
 
-                        // Traverse the route (again, from end to start because it is stored in reverse)
-                        for (int i = cycle.size() - 1; i > 0; --i) {
-                            int fromNode = cycle[i];
-                            int toNode = cycle[i - 1];
+                    // Traverse the route (again, from end to start because it is stored in reverse)
+                    for (int i = cycle.size() - 1; i > 0; --i) {
+                        int fromNode = cycle[i];
+                        int toNode = cycle[i - 1];
 
-                            // Find the specific edge in order to retrieve its rate and fee
-                            for (const auto& e: edges) {
-                                if (e.source ==  fromNode && e.destination == toNode) {
-                                    double actualRate = e.weight * (1.0 - e.fee);
-                                    profitMultiplier *= actualRate;
-                                    break;
-                                }
+                        // Find the specific edge in order to retrieve its rate and fee
+                        for (const auto& e: edges) {
+                            if (e.source ==  fromNode && e.destination == toNode) {
+                                double actualRate = e.weight * (1.0 - e.fee);
+                                profitMultiplier *= actualRate;
+                                break;
                             }
                         }
+                    }
 
-                        // Compute the net profit percentage
-                        // For example: 1.025 becomes 2.5%
-                        double profitPercentage = (profitMultiplier - 1.0) * 100.0;
-                        std::cout << "[PROFIT] Expected Arbitrage Profit: " << profitPercentage << "%" << std::endl;
-                        std::cout << "-------------------------------------------\n" << std::endl;
-                        // --- End of profit calculation ---
-                        
-                        return;
+                    // Compute the net profit percentage
+                    // For example: 1.025 becomes 2.5%
+                    double profitPercentage = (profitMultiplier - 1.0) * 100.0;
+                    std::cout << "[PROFIT] Expected Arbitrage Profit: " << profitPercentage << "%" << std::endl;
+                    std::cout << "-------------------------------------------\n" << std::endl;
+                    // --- End of profit calculation ---
+                    
+                    return;
                 }
             }
             std::cout << "\n[SYSTEM] No arbitrage found from " << sourceCurrency << "." << std::endl;

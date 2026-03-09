@@ -1,14 +1,30 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 
-# שם הפרויקט והשפה
-project(CryptoArbitrageEngine CXX)
+project(CryptoArbitrageEngine LANGUAGES CXX)
 
-# שימוש בסטנדרט C++20 (הכי חדיש, חשוב לביצועים)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# הגדרת תיקיית ה-include (איפה שישבו קובצי ה-.hpp שלנו)
-include_directories(include)
+set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
 
-# יצירת קובץ הריצה מתוך קובץ המקור
+find_package(OpenSSL REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+
+set(USE_TLS ON CACHE BOOL "Enable TLS for IXWebSocket" FORCE)
+set(USE_OPEN_SSL ON CACHE BOOL "Use OpenSSL" FORCE)
+
+add_subdirectory(external/IXWebSocket)
+
 add_executable(ArbitrageEngine src/main.cpp)
+
+target_include_directories(ArbitrageEngine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(ArbitrageEngine PRIVATE
+    ixwebsocket::ixwebsocket
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+)
