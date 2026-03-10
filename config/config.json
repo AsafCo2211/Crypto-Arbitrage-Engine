@@ -1,0 +1,31 @@
+{
+    "fee": 0.001,
+    "scanIntervalMs": 100,
+    "minProfitPercent": 0.1,
+    "maxQuoteAgeMs": 3000,
+    "cooldownSeconds": 10,
+    "sourceCurrency": "USDT",
+    "simulationNotionals": [100, 500, 1000],
+    "symbols": [
+        { "stream": "btcusdt",  "base": "BTC",  "quote": "USDT" },
+        { "stream": "ethusdt",  "base": "ETH",  "quote": "USDT" },
+        { "stream": "bnbusdt",  "base": "BNB",  "quote": "USDT" },
+        { "stream": "solusdt",  "base": "SOL",  "quote": "USDT" },
+        { "stream": "xrpusdt",  "base": "XRP",  "quote": "USDT" },
+        { "stream": "adausdt",  "base": "ADA",  "quote": "USDT" },
+        { "stream": "dogeusdt", "base": "DOGE", "quote": "USDT" },
+        { "stream": "dotusdt",  "base": "DOT",  "quote": "USDT" },
+        { "stream": "linkusdt", "base": "LINK", "quote": "USDT" },
+        { "stream": "maticusdt","base": "MATIC","quote": "USDT" },
+        { "stream": "ethbtc",   "base": "ETH",  "quote": "BTC"  },
+        { "stream": "bnbbtc",   "base": "BNB",  "quote": "BTC"  },
+        { "stream": "solbtc",   "base": "SOL",  "quote": "BTC"  },
+        { "stream": "xrpbtc",   "base": "XRP",  "quote": "BTC"  },
+        { "stream": "adabtc",   "base": "ADA",  "quote": "BTC"  },
+        { "stream": "dogebtc",  "base": "DOGE", "quote": "BTC"  },
+        { "stream": "dotbtc",   "base": "DOT",  "quote": "BTC"  },
+        { "stream": "linkbtc",  "base": "LINK", "quote": "BTC"  },
+        { "stream": "maticbtc", "base": "MATIC","quote": "BTC"  },
+        { "stream": "ltcusdt",  "base": "LTC",  "quote": "USDT" }
+    ]
+}

@@ -1,0 +1,144 @@
+#include <gtest/gtest.h>
+#include "Graph.hpp"
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Builds a small graph with a known profitable triangle:
+//   USDT → ETH → BTC → USDT
+// The rates are chosen so the cycle multiplier is > 1 even after fees,
+// making it a genuine negative-weight cycle in log-space.
+Graph buildArbitrageGraph(double fee = 0.0) {
+    Graph g;
+    // USDT → ETH: buy ETH at ask 100 USDT → rate = 1/100 = 0.01
+    g.updateExchangeRate("USDT", "ETH",  0.01,   fee);
+    // ETH → BTC: sell ETH for BTC at bid 0.075 BTC/ETH
+    g.updateExchangeRate("ETH",  "BTC",  0.075,  fee);
+    // BTC → USDT: sell BTC for USDT at bid 1400 USDT/BTC
+    // 0.01 * 0.075 * 1400 = 1.05  → 5% theoretical profit
+    g.updateExchangeRate("BTC",  "USDT", 1400.0, fee);
+    return g;
+}
+
+// Builds a graph with no profitable cycle.
+// Rates are perfectly consistent: ETH=3200, BTC=60000, ETH/BTC=3200/60000
+// Any triangle USDT→ETH→BTC→USDT yields exactly 1.0 before fees,
+// and less than 1.0 after fees — so no arbitrage exists.
+Graph buildNoArbitrageGraph(double fee = 0.001) {
+    Graph g;
+    const double ethPrice = 3200.0;
+    const double btcPrice = 60000.0;
+    const double ethBtc   = ethPrice / btcPrice; // 0.05333...
+
+    g.updateExchangeRate("USDT", "ETH",  1.0 / ethPrice, fee);
+    g.updateExchangeRate("ETH",  "USDT", ethPrice,        fee);
+    g.updateExchangeRate("ETH",  "BTC",  ethBtc,          fee);
+    g.updateExchangeRate("BTC",  "ETH",  1.0 / ethBtc,    fee);
+    g.updateExchangeRate("BTC",  "USDT", btcPrice,         fee);
+    g.updateExchangeRate("USDT", "BTC",  1.0 / btcPrice,  fee);
+    return g;
+}
+
+// ── Currency registry tests ───────────────────────────────────────────────────
+
+TEST(GraphTest, AddNewCurrencyIncrementsVertexCount) {
+    Graph g;
+    EXPECT_EQ(g.getNumVertices(), 0);
+    g.addCurrency("USDT");
+    EXPECT_EQ(g.getNumVertices(), 1);
+    g.addCurrency("ETH");
+    EXPECT_EQ(g.getNumVertices(), 2);
+}
+
+TEST(GraphTest, AddDuplicateCurrencyDoesNotIncrement) {
+    Graph g;
+    g.addCurrency("USDT");
+    g.addCurrency("USDT");
+    EXPECT_EQ(g.getNumVertices(), 1);
+}
+
+TEST(GraphTest, UpdateExchangeRateAddsEdge) {
+    Graph g;
+    g.updateExchangeRate("USDT", "ETH", 0.01);
+    EXPECT_EQ(g.getEdges().size(), 1u);
+}
+
+TEST(GraphTest, UpdateExchangeRateUpdatesExistingEdge) {
+    Graph g;
+    g.updateExchangeRate("USDT", "ETH", 0.01);
+    g.updateExchangeRate("USDT", "ETH", 0.02); // update, not insert
+    EXPECT_EQ(g.getEdges().size(), 1u);
+    EXPECT_DOUBLE_EQ(g.getEdges()[0].weight, 0.02);
+}
+
+// ── Arbitrage detection tests ─────────────────────────────────────────────────
+
+TEST(GraphTest, DetectsKnownArbitrageCycle) {
+    // Redirect stdout to capture output
+    testing::internal::CaptureStdout();
+
+    Graph g = buildArbitrageGraph(0.0);
+    // threshold=0, freshness=very large so no edge is filtered
+    g.findArbitrage("USDT", 0.0, 999999999, 0);
+
+    std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_NE(output.find("ARBITRAGE"), std::string::npos)
+        << "Expected arbitrage to be detected but got:\n" << output;
+}
+
+TEST(GraphTest, NoFalsePositiveOnFairMarket) {
+    testing::internal::CaptureStdout();
+
+    Graph g = buildNoArbitrageGraph(0.001);
+    g.findArbitrage("USDT", 0.0, 999999999, 0);
+
+    std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(output.find("ARBITRAGE"), std::string::npos)
+        << "False positive: arbitrage reported on fair market rates";
+}
+
+TEST(GraphTest, FeesEliminateSmallArbitrage) {
+    testing::internal::CaptureStdout();
+
+    // 5% theoretical profit, but with 2% fee per leg (3 legs = ~6%) it vanishes
+    Graph g = buildArbitrageGraph(0.02);
+    g.findArbitrage("USDT", 0.0, 999999999, 0);
+
+    std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(output.find("ARBITRAGE"), std::string::npos)
+        << "Arbitrage should be eliminated by high fees";
+}
+
+TEST(GraphTest, ProfitThresholdFiltersSmallOpportunities) {
+    testing::internal::CaptureStdout();
+
+    Graph g = buildArbitrageGraph(0.0); // 5% theoretical profit
+    // Set threshold above 5% — should be filtered out
+    g.findArbitrage("USDT", 10.0, 999999999, 0);
+
+    std::string output = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(output.find("ARBITRAGE"), std::string::npos)
+        << "Opportunity below threshold should not be reported";
+}
+
+TEST(GraphTest, MissingSourceCurrencyHandledGracefully) {
+    testing::internal::CaptureStderr();
+    Graph g;
+    g.updateExchangeRate("ETH", "BTC", 0.05);
+    // Should not crash — just print an error
+    EXPECT_NO_THROW(g.findArbitrage("USDT", 0.0, 999999999, 0));
+    testing::internal::GetCapturedStderr();
+}
+
+TEST(GraphTest, ZeroRateIsRejectedAndDoesNotCrash) {
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+
+    Graph g;
+    g.updateExchangeRate("USDT", "ETH",  0.0,   0.001); // invalid
+    g.updateExchangeRate("ETH",  "USDT", 3200.0, 0.001);
+
+    EXPECT_NO_THROW(g.findArbitrage("USDT", 0.0, 999999999, 0));
+
+    testing::internal::GetCapturedStdout();
+    testing::internal::GetCapturedStderr();
+}

@@ -4,172 +4,281 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <algorithm>
+#include "StatsCollector.hpp"
+#include "SimulationEngine.hpp"
 
-// Structure representing an exchange rate between two currencies
+using Clock     = std::chrono::steady_clock;
+using TimePoint = std::chrono::time_point<Clock>;
+
+// Represents a directed exchange-rate edge between two currencies.
 struct Edge {
-    int source; // ID of the currency being converted from
-    int destination; // ID of the currency being converted to
-    double weight; // The actual exchange rate (e.g., 1 USD = 0.85 EUR would have a weight of 0.85)
-    double fee; // Transaction fee (as a percentage, e.g., 0.1 for 0.1%)
+    int    source;      // Numeric ID of the currency being converted from
+    int    destination; // Numeric ID of the currency being converted to
+    double weight;      // Raw exchange rate (e.g. 1 ETH = 3200 USDT → weight = 3200)
+    double fee;         // Taker fee for this leg (e.g. 0.001 = 0.1%)
+    TimePoint lastUpdated; // When this rate was last received from the exchange
 };
 
 class Graph {
-    private:
-        int numVertices; // Number of currencies (vertices)
-        std::vector<Edge> edges; 
+private:
+    int numVertices;
+    std::vector<Edge> edges;
+    std::unordered_map<std::string, size_t> edgeIndex;
 
-        // Fast lookup map to translate a currency name to 
-        // into its internal numeric ID (e.g., "USD" -> 0, "EUR" -> 1)
-        std::unordered_map<std::string, int> currencyToIndex;
-        std::vector<std::string> indexToCurrency;
+    std::unordered_map<std::string, int>         currencyToIndex;
+    std::vector<std::string>                     indexToCurrency;
 
-    public:
-        Graph() : numVertices(0) {}
+    // Dedup: maps a cycle signature → time it was last reported.
+    // Prevents the same route from flooding the terminal every 100ms.
+    std::unordered_map<std::string, TimePoint>   lastReported;
 
-        // Adds a new currency to the graph and returns its ID
-        int addCurrency(const std::string& currency) {
-            if (currencyToIndex.find(currency) == currencyToIndex.end()) {
-                currencyToIndex[currency] = numVertices;
-                indexToCurrency.push_back(currency);
-                numVertices++;
+    StatsCollector*   stats = nullptr;
+    SimulationEngine* sim   = nullptr;
+
+    static constexpr bool DEBUG_GRAPH_UPDATES = false;
+
+    std::string makeEdgeKey(int src, int dst) const {
+        return std::to_string(src) + "->" + std::to_string(dst);
+    }
+
+    // Builds a stable string signature for a cycle so we can dedup it.
+    // e.g.  USDT->ETH->BTC->USDT
+    std::string cycleSignature(const std::vector<int>& cycle) const {
+        std::string sig;
+        for (int i = static_cast<int>(cycle.size()) - 1; i >= 0; --i) {
+            sig += indexToCurrency[cycle[i]];
+            if (i > 0) sig += "->";
+        }
+        return sig;
+    }
+
+public:
+    Graph() : numVertices(0) {}
+
+    void attachStats(StatsCollector& collector) { stats = &collector; }
+    void attachSim(SimulationEngine& engine)    { sim   = &engine;    }
+
+    // Adds a new currency to the graph if it does not already exist.
+    int addCurrency(const std::string& currency) {
+        if (currencyToIndex.find(currency) == currencyToIndex.end()) {
+            currencyToIndex[currency] = numVertices;
+            indexToCurrency.push_back(currency);
+            numVertices++;
+        }
+        return currencyToIndex[currency];
+    }
+
+    // Adds or updates a directed exchange-rate edge.
+    // The timestamp is always refreshed to now so freshness checks work correctly.
+    void updateExchangeRate(const std::string& from, const std::string& to,
+                            double rate, double fee = 0.0) {
+        int u = addCurrency(from);
+        int v = addCurrency(to);
+
+        std::string key = makeEdgeKey(u, v);
+        auto it = edgeIndex.find(key);
+
+        if (it != edgeIndex.end()) {
+            Edge& edge    = edges[it->second];
+            edge.weight      = rate;
+            edge.fee         = fee;
+            edge.lastUpdated = Clock::now();
+
+            if (DEBUG_GRAPH_UPDATES) {
+                std::cout << "[GRAPH] Updated: " << from << " -> " << to
+                          << " | rate=" << rate << " | fee=" << fee << '\n';
             }
-            return currencyToIndex[currency];
+            return;
         }
 
-        // Adds an exchange rate (edge) to the graph
-        void addExchangeRate(const std::string& from, const std::string& to, double rate, double fee = 0.0) {
-            int u = addCurrency(from);
-            int v = addCurrency(to);
+        edges.push_back({u, v, rate, fee, Clock::now()});
+        edgeIndex[key] = edges.size() - 1;
 
-            edges.push_back({u, v, rate, fee});
+        if (DEBUG_GRAPH_UPDATES) {
+            std::cout << "[GRAPH] Added: " << from << " -> " << to
+                      << " | rate=" << rate << " | fee=" << fee << '\n';
+        }
+    }
+
+    int getNumVertices()                       const { return numVertices; }
+    const std::vector<Edge>& getEdges()        const { return edges; }
+    const std::vector<std::string>& getIndexToCurrency() const { return indexToCurrency; }
+
+    void printGraph() const {
+        std::cout << "\n--- Market Graph ---\n";
+        for (const auto& edge : edges) {
+            std::cout << indexToCurrency[edge.source] << " -> "
+                      << indexToCurrency[edge.destination]
+                      << " (Rate: " << edge.weight << ")\n";
+        }
+        std::cout << "--------------------\n\n";
+    }
+
+    // Runs Bellman-Ford from sourceCurrency and reports any arbitrage cycles found.
+    //
+    // Parameters:
+    //   sourceCurrency   – starting node (e.g. "USDT")
+    //   minProfitPercent – only report cycles with net profit above this threshold (%)
+    //   maxQuoteAgeMs    – skip edges whose quote is older than this many milliseconds
+    //   cooldownSeconds  – suppress re-reporting the same cycle within this window (seconds)
+    void findArbitrage(const std::string& sourceCurrency,
+                       double minProfitPercent = 0.1,
+                       int    maxQuoteAgeMs    = 3000,
+                       int    cooldownSeconds  = 10,
+                       const std::vector<double>& simNotionals = {}) {
+
+        if (currencyToIndex.find(sourceCurrency) == currencyToIndex.end()) {
+            std::cerr << "[ERROR] Source currency not found in graph: " << sourceCurrency << '\n';
+            return;
         }
 
-        void updateExchangeRate(const std::string& from, const std::string& to, double rate, double fee = 0.0) {
-            int u = addCurrency(from);
-            int v = addCurrency(to);
+        if (stats) stats->recordScan();
 
-            for (auto& edge : edges) {
-                if (edge.source == u && edge.destination == v) {
-                    edge.weight = rate;
-                    edge.fee = fee;
-                    return;
-                }  
-            }
-        }
+        const int sourceNode = currencyToIndex[sourceCurrency];
+        const auto now       = Clock::now();
 
-        int getNumVertices() const { return numVertices; }
-        const std::vector<Edge>& getEdges() const { return edges; }
-        const std::vector<std::string>& getIndexToCurrency() const { return indexToCurrency; }
+        // ── Step 1: Relax edges V-1 times ───────────────────────────────────────
+        std::vector<double> dist(numVertices, std::numeric_limits<double>::infinity());
+        std::vector<int>    pred(numVertices, -1);
+        dist[sourceNode] = 0.0;
 
-        // Prints the graph for debugging purposes
-        void printGraph() const {
-            std::cout << "\n--- Market Graph ---" << std::endl;
+        for (int i = 0; i < numVertices - 1; ++i) {
             for (const auto& edge : edges) {
-                std::cout << indexToCurrency[edge.source] << " -> " 
-                          << indexToCurrency[edge.destination]
-                          << " (Rate: " << edge.weight << ")" << std::endl;
+
+                // Freshness check: ignore stale quotes.
+                // A stale rate could make a dead opportunity look live.
+                auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - edge.lastUpdated).count();
+                if (ageMs > maxQuoteAgeMs) continue;
+
+                double actualRate = edge.weight * (1.0 - edge.fee);
+
+                // Guard: log(0) = -inf, log(negative) = NaN — both corrupt dist[].
+                if (actualRate <= 0.0) continue;
+
+                double w = -std::log(actualRate);
+
+                if (dist[edge.source] != std::numeric_limits<double>::infinity() &&
+                    dist[edge.source] + w < dist[edge.destination]) {
+                    dist[edge.destination] = dist[edge.source] + w;
+                    pred[edge.destination] = edge.source;
+                }
             }
-            std::cout << "--------------------\n" << std::endl;
         }
 
-        // Runs the Bellman-Ford algorithm to search for arbitrage opportunities
-        void findArbitrage(const std::string& sourceCurrency) {
-            // Make sure the currency exists in the system
-            if (currencyToIndex.find(sourceCurrency) == currencyToIndex.end()) {
-                std::cout << "[ERROR] Currency not found in graph!" << std::endl;
+        // ── Step 2: Detect negative-weight cycles ───────────────────────────────
+        for (const auto& edge : edges) {
+
+            auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - edge.lastUpdated).count();
+            if (ageMs > maxQuoteAgeMs) continue;
+
+            double actualRate = edge.weight * (1.0 - edge.fee);
+            if (actualRate <= 0.0) continue;
+
+            double w = -std::log(actualRate);
+
+            if (dist[edge.source] == std::numeric_limits<double>::infinity() ||
+                dist[edge.source] + w >= dist[edge.destination]) continue;
+
+            // ── Cycle extraction ────────────────────────────────────────────────
+            int curr = edge.destination;
+
+            // Walk back V times to ensure we land inside the cycle,
+            // not on a path leading into it.
+            for (int i = 0; i < numVertices; ++i) {
+                if (pred[curr] == -1) {
+                    std::cerr << "[WARN] Cycle extraction aborted: broken predecessor chain.\n";
+                    return;
+                }
+                curr = pred[curr];
+            }
+
+            const int      cycleStart = curr;
+            std::vector<int> cycle;
+            int            maxSteps  = numVertices;
+
+            do {
+                cycle.push_back(curr);
+                if (pred[curr] == -1) {
+                    std::cerr << "[WARN] Cycle extraction aborted mid-walk.\n";
+                    return;
+                }
+                curr = pred[curr];
+                --maxSteps;
+            } while (curr != cycleStart && maxSteps > 0);
+
+            if (curr != cycleStart) {
+                std::cerr << "[WARN] Cycle extraction aborted: start node not reached.\n";
                 return;
             }
-            int sourceNode = currencyToIndex[sourceCurrency];
+            cycle.push_back(cycleStart);
 
+            // ── Profit calculation ──────────────────────────────────────────────
+            double profitMultiplier = 1.0;
+            bool   edgeMissing      = false;
 
-            // Distance array (initialized to infinity)
-            std::vector<double> minDistance(numVertices, std::numeric_limits<double>::infinity());
-            // Predecessor array (used later to reconstruct the money path)
-            std::vector<int> predecessor(numVertices, -1);
+            for (int i = static_cast<int>(cycle.size()) - 1; i > 0; --i) {
+                int from = cycle[i];
+                int to   = cycle[i - 1];
 
-            minDistance[sourceNode] = 0.0;
-
-            // Step 1: Relax all edges V-1 times (the core of the algorithm)
-            for (int i = 0; i < numVertices - 1; ++i) {
-                for (const auto& edge : edges) {
-                    // Convert the exchange rate into a graph weight:
-                    // negative logarithm of the rate
-                    double actualRate = edge.weight * (1.0 - edge.fee);
-                    double weight = -std::log(actualRate); 
-
-                    if (minDistance[edge.source] !=  std::numeric_limits<double>::infinity() &&
-                        minDistance[edge.source] +  weight < minDistance[edge.destination]) {
-                            minDistance[edge.destination] = minDistance[edge.source] + weight;
-                            predecessor[edge.destination] = edge.source;
-                    }
+                auto it = edgeIndex.find(makeEdgeKey(from, to));
+                if (it == edgeIndex.end()) {
+                    std::cerr << "[WARN] Profit calc aborted: missing edge "
+                              << indexToCurrency[from] << " -> " << indexToCurrency[to] << '\n';
+                    edgeMissing = true;
+                    break;
                 }
+                const Edge& e = edges[it->second];
+                profitMultiplier *= e.weight * (1.0 - e.fee);
             }
 
-            // Step 2: Check whether a negative-weight cycle exists
-            // (which means guaranteed profit)
-            for (const auto& edge : edges) {
-                double actualRate = edge.weight * (1.0 - edge.fee);
-                double weight = -std::log(actualRate);
-                if (minDistance[edge.source] != std::numeric_limits<double>::infinity() &&
-                    minDistance[edge.source] + weight < minDistance[edge.destination]) {
-                    std::cout << "\n[$$$] ARBITRAGE OPPORTUNITY DETECTED! [$$$]" << std::endl;
-                    
-                    // --- Start of path extraction code ---
-                    int curr = edge.destination;
-                    // Move backward V times to guarantee that we are deep inside the cycle itself
-                    for (int i = 0; i < numVertices; ++i) {
-                        curr = predecessor[curr];
-                    }
+            if (edgeMissing) return;
 
-                    int  cycleStart = curr;
-                    std::vector<int> cycle;
-                    
-                    // Collect the nodes (currencies) that belong to the cycle
-                    do {
-                        cycle.push_back(curr);
-                        curr = predecessor[curr];
-                    } while (curr  != cycleStart);
-                    cycle.push_back(cycleStart); 
-                    
-                    // Print the route (it was collected from end to start, so print it in reverse)
-                    std::cout << "[ROUTE] Execute Trade: ";
-                    for (int i = cycle.size() - 1; i >= 0; --i) {
-                        std::cout << indexToCurrency[cycle[i]];
-                        if (i > 0) std::cout << " -> ";
-                    }
-                    std::cout << "\n" << std::endl;
-                    // --- End of path extraction code ---
+            double profitPct = (profitMultiplier - 1.0) * 100.0;
 
-                    // --- Start of profit calculation code ---
-                    double profitMultiplier = 1.0; // Start with "one unit" of the initial currency
+            // ── Profit threshold ────────────────────────────────────────────────
+            // Skip tiny noise that would disappear after real execution costs.
+            if (profitPct < minProfitPercent) return;
 
-                    // Traverse the route (again, from end to start because it is stored in reverse)
-                    for (int i = cycle.size() - 1; i > 0; --i) {
-                        int fromNode = cycle[i];
-                        int toNode = cycle[i - 1];
+            // ── Dedup / cooldown ────────────────────────────────────────────────
+            // Build a stable route string and check when we last reported it.
+            std::string sig = cycleSignature(cycle);
+            auto dedupIt    = lastReported.find(sig);
 
-                        // Find the specific edge in order to retrieve its rate and fee
-                        for (const auto& e: edges) {
-                            if (e.source ==  fromNode && e.destination == toNode) {
-                                double actualRate = e.weight * (1.0 - e.fee);
-                                profitMultiplier *= actualRate;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Compute the net profit percentage
-                    // For example: 1.025 becomes 2.5%
-                    double profitPercentage = (profitMultiplier - 1.0) * 100.0;
-                    std::cout << "[PROFIT] Expected Arbitrage Profit: " << profitPercentage << "%" << std::endl;
-                    std::cout << "-------------------------------------------\n" << std::endl;
-                    // --- End of profit calculation ---
-                    
-                    return;
-                }
+            if (dedupIt != lastReported.end()) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                   now - dedupIt->second).count();
+                if (elapsed < cooldownSeconds) return; // still in cooldown
             }
-            std::cout << "\n[SYSTEM] No arbitrage found from " << sourceCurrency << "." << std::endl;
+            lastReported[sig] = now;
+
+            // ── Report ─────────────────────────────────────────────────────────
+            std::cout << "\n[$$$] ARBITRAGE OPPORTUNITY DETECTED! [$$$]\n";
+            std::cout << "[ROUTE]  " << sig << '\n';
+            std::cout << "[PROFIT] Theoretical: " << profitPct << "%\n\n";
+
+            // ── Slippage simulation ─────────────────────────────────────────────
+            // Walk the cycle as (from, to) pairs and run each notional size
+            // through the actual order book to get a realistic net profit.
+            if (sim && !simNotionals.empty()) {
+                std::vector<std::pair<std::string, std::string>> steps;
+                for (int i = static_cast<int>(cycle.size()) - 1; i > 0; --i) {
+                    steps.emplace_back(indexToCurrency[cycle[i]],
+                                       indexToCurrency[cycle[i - 1]]);
+                }
+                sim->simulate(steps, simNotionals, minProfitPercent);
+            }
+
+            std::cout << "-------------------------------------------\n\n";
+
+            if (stats) stats->recordOpportunity(sig, profitPct);
+
+            return;
         }
+    }
 };
