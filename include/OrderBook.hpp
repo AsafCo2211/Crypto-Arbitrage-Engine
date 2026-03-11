@@ -19,13 +19,24 @@
  * ### Thread safety
  *
  * OrderBookStore is written by the WebSocket callback thread and read by the
- * scanner thread. All access is protected by a single internal mutex.
+ * scanner thread concurrently. Access is synchronised with a `std::shared_mutex`:
+ *
+ * - **Reads** (findEdgeInfo, getBook) acquire a `std::shared_lock` — multiple
+ *   reader threads can proceed in parallel without blocking each other.
+ * - **Writes** (registerSymbol, updateBook) acquire a `std::unique_lock` —
+ *   exclusive access ensures no reader sees a partially written snapshot.
+ *
+ * This is a deliberate improvement over a plain `std::mutex`: in a high-throughput
+ * scenario the scanner thread reads many symbols per scan cycle while the WebSocket
+ * thread writes one symbol at a time. Allowing concurrent reads eliminates the
+ * read-read contention that a plain mutex would introduce.
  */
 
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <shared_mutex>
 #include <chrono>
 
 using Clock     = std::chrono::steady_clock;
@@ -84,10 +95,15 @@ struct EdgeBookInfo {
  * 1. Call registerSymbol() once per symbol at startup (before any WebSocket data arrives)
  * 2. Call updateBook() from the WebSocket callback thread on every depth update
  * 3. Call findEdgeInfo() / getBook() from the scanner thread during simulation
+ * ### Locking strategy
+ *
+ * Uses `std::shared_mutex` so that concurrent reads (scanner + any future
+ * reader threads) proceed in parallel, while writes (WebSocket callback)
+ * take an exclusive lock only for the duration of a single book update.
  */
 class OrderBookStore {
 private:
-    mutable std::mutex mutex;
+    mutable std::shared_mutex mutex;
 
     std::unordered_map<std::string, OrderBook>    books;      ///< symbol → book snapshot
     std::unordered_map<std::string, EdgeBookInfo> edgeLookup; ///< "FROM->TO" → book + side
@@ -111,9 +127,9 @@ public:
     void registerSymbol(const std::string& symbol,
                         const std::string& base,
                         const std::string& quote) {
-        std::lock_guard<std::mutex> lock(mutex);
-        edgeLookup[quote + "->" + base] = {symbol, true};   // buying base  → use asks
-        edgeLookup[base  + "->" + quote] = {symbol, false};  // selling base → use bids
+        std::unique_lock<std::shared_mutex> lock(mutex); // exclusive — write
+        edgeLookup[quote + "->" + base] = {symbol, true};
+        edgeLookup[base  + "->" + quote] = {symbol, false};
     }
 
     /**
@@ -129,7 +145,7 @@ public:
     void updateBook(const std::string& symbol,
                     std::vector<PriceLevel> asks,
                     std::vector<PriceLevel> bids) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::shared_mutex> lock(mutex); // exclusive — write
         books[symbol] = {std::move(asks), std::move(bids), Clock::now()};
     }
 
@@ -143,7 +159,7 @@ public:
      */
     bool findEdgeInfo(const std::string& from, const std::string& to,
                       EdgeBookInfo& out) const {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::shared_lock<std::shared_mutex> lock(mutex); // shared — read
         auto it = edgeLookup.find(from + "->" + to);
         if (it == edgeLookup.end()) return false;
         out = it->second;
@@ -158,7 +174,7 @@ public:
      * @return       true if the symbol has a stored book, false otherwise
      */
     bool getBook(const std::string& symbol, OrderBook& out) const {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::shared_lock<std::shared_mutex> lock(mutex); // shared — read
         auto it = books.find(symbol);
         if (it == books.end()) return false;
         out = it->second;

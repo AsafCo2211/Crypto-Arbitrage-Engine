@@ -123,7 +123,9 @@ Buying $500 of ETH at ask=3200.00 (0.5 ETH available):
 | Scanner | Wakes on `marketDirty` flag, runs Bellman-Ford |
 | Summary | Prints stats every 30 seconds |
 
-All shared state is protected by a single `marketMutex`. The `marketDirty` flag is an `std::atomic<bool>` to avoid locking on every tick.
+All shared state in the market **Graph** is protected by a single `marketMutex`. The `marketDirty` flag is an `std::atomic<bool>` to avoid locking on every tick.
+
+**OrderBookStore** uses a `std::shared_mutex` instead of a plain mutex. Reads (`findEdgeInfo`, `getBook`) acquire a `std::shared_lock`, allowing the scanner thread to read multiple symbols concurrently. Writes (`updateBook`) acquire a `std::unique_lock` for exclusive access during the update.
 
 ---
 
